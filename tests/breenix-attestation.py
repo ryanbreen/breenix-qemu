@@ -14,6 +14,9 @@ args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 source = (root / 'hw/display/virtio-gpu-virgl.c').read_text()
 block = source[source.index('#define BREENIX_ATTEST'):source.index('static void breenix_attest(const char *event')]
+submit_start = source.index('    if (!breenix_attest_submitted) {',
+                            source.index('static void virgl_cmd_submit_3d('))
+submit = source[submit_start:source.index('\nout:', submit_start)]
 stub = r'''
 #include <glib.h>
 #include <stdio.h>
@@ -33,8 +36,16 @@ static const char *renderer="ANGLE Metal Renderer: Apple fixture";
 static const char *glGetString(int key) { return key==GL_RENDERER ? renderer : "fixture"; }
 static const char *eglQueryString(int display,int key) { g_assert(display==1); g_assert(key>=4); return "fixture"; }
 BLOCK
-static void event(const char *name, uint32_t id) {
+static void breenix_attest(const char *name, uint32_t id) {
     BreenixAttest a={ name,id }; breenix_attest_job(&a);
+}
+static void event(const char *name, uint32_t id) {
+    if (!strcmp(name, "first-submit-3d")) {
+        struct { struct { uint32_t ctx_id; } hdr; } cs = { { id } };
+        SUBMIT
+    } else {
+        breenix_attest(name, id);
+    }
 }
 int main(int argc,char **argv) {
     g_assert(argc==3);
@@ -51,7 +62,7 @@ int main(int argc,char **argv) {
     OVERFLOW
     return 0;
 }
-'''.replace('BLOCK', block)
+'''.replace('BLOCK', block).replace('SUBMIT', submit)
 # The overflow mode targets the production byte bound without a large output.
 overflow = '''if (!strcmp(argv[2],"overflow")) {
     breenix_attest_bytes=BREENIX_ATTEST_MAX_BYTES;
