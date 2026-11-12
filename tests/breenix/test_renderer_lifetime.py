@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get('BREENIX_RENDERER_SOURCE', Path(__file__).resolve().parents[2]))
 
 
 def function(text, name):
@@ -45,7 +45,8 @@ typedef struct { int unused; } BRW;
 #define RS_INIT_FAILED 3
 typedef struct Notifier { void (*notify)(struct Notifier *, void *); } Notifier;
 static Notifier renderer_exit_notifier;
-static void renderer_exit(Notifier *notifier, void *data) { (void)notifier; (void)data; }
+static bool stopped;
+static void brw_stop(BRW *worker) { (void)worker; stopped = true; }
 static void qemu_add_exit_notifier(Notifier *notifier) { (void)notifier; }
 static BRW *renderer_worker;
 static QEMUBH *renderer_done_bh;
@@ -60,6 +61,7 @@ static void aio_poll(void *ctx, bool blocking) { (void)ctx; main_loop_wait(block
 static void *iohandler_get_aio_context(void) { return NULL; }
 #define AIO_WAIT_WHILE(ctx, cond) do { while (cond) main_loop_wait(false); } while (0)
 QUIESCE
+EXIT
 static void reset_from_response(void) {
     /* Like memory_region_access_valid: a BAR access re-entering this
      * transport is refused while its BH's mem_reentrancy_guard is set. */
@@ -102,12 +104,20 @@ int main(int argc, char **argv) {
     VirtIOGPU gpu = {0};
     virtio_gpu_gl_handle_ctrl(&gpu, &gpu);
     assert(renderer_done_bh);
+    if (!strcmp(argv[1], "exit")) {
+        assert(renderer_exit_notifier.notify);
+        renderer_exit_notifier.notify(NULL, NULL);
+        assert(stopped && renderer_quiescing);
+        return 0;
+    }
     engaged = renderer_done_bh->guarded;
     renderer_done(NULL);
     assert(!renderer_co);
     /* Keep both BH constructors referenced on either source version. */
     (void)qemu_bh_new; (void)virtio_bh_io_new_guarded;
     (void)qemu_coroutine_self;
+    (void)renderer_exit; (void)brw_stop; (void)qemu_add_exit_notifier;
+    (void)aio_poll; (void)iohandler_get_aio_context;
     return 0;
 }
 '''
@@ -116,6 +126,9 @@ int main(int argc, char **argv) {
         handle = handle.replace('g->parent_obj.scanout[0].con', 'NULL')
         handle = handle.replace('VirtQueue *vq)', 'VirtQueue *vq G_GNUC_UNUSED)')
         code = code.replace('QUIESCE', function(source, 'renderer_quiesce'))
+        exit_body = function(source, 'renderer_exit') if 'static void renderer_exit(' in source else ('static void renderer_exit(Notifier *n, void *d) { (void)n; (void)d; }')
+        exit_body = exit_body.replace('Notifier *notifier, void *data)', 'Notifier *notifier G_GNUC_UNUSED, void *data G_GNUC_UNUSED)')
+        code = code.replace('EXIT', exit_body)
         code = code.replace('DONE', function(source, 'renderer_done'))
         code = code.replace('HANDLE', handle)
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,11 +139,27 @@ int main(int argc, char **argv) {
                             str(path), '-o', str(exe)], check=True)
             def no_core():
                 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            for mode, expected in [('response', 0), ('self', -signal.SIGABRT)]:
+            for mode, expected in [('response', 0), ('self', -signal.SIGABRT), ('exit', 0)]:
                 with self.subTest(mode=mode):
                     result = subprocess.run([str(exe), mode], capture_output=True,
                                             timeout=3, preexec_fn=no_core)
                     self.assertEqual(result.returncode, expected, result.stderr.decode())
+
+    def test_worker_requires_async_callback_api(self):
+        source = (ROOT / 'hw/display/virtio-gpu-virgl.c').read_text()
+        start = source.index('/*\n * VIRGL_CHECK_VERSION available')
+        end = source.index('struct virtio_gpu_virgl_resource {')
+        gate = source[start:end]
+        for version, callbacks, accepted in [((1, 1, 1), 4, False),
+                                               ((1, 1, 2), 3, False),
+                                               ((1, 1, 2), 4, True)]:
+            with self.subTest(version=version, callbacks=callbacks):
+                argv = ['cc', '-x', 'c', '-fsyntax-only', '-']
+                for name, value in zip(('MAJOR', 'MINOR', 'MICRO'), version):
+                    argv.append(f'-DVIRGL_VERSION_{name}={value}')
+                argv.append(f'-DVIRGL_RENDERER_CALLBACKS_VERSION={callbacks}')
+                result = subprocess.run(argv, input=gate, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
 
 if __name__ == '__main__':
