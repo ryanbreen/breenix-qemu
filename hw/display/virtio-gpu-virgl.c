@@ -46,6 +46,12 @@ extern EGLContext breenix_renderer_share;
      VIRGL_VERSION_MICRO >= (micro))
 #endif
 
+/* The renderer worker cannot deliver the synchronous fence callback: it owns
+ * neither BQL nor an RCU read-side section. This fork requires async delivery. */
+#if !VIRGL_CHECK_VERSION(1, 1, 2) || VIRGL_RENDERER_CALLBACKS_VERSION < 4
+#error "Breenix renderer worker requires virglrenderer 1.1.2 async callbacks v4"
+#endif
+
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
@@ -577,7 +583,8 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
  * after that context's first SUBMIT_3D: the context that executes the guest's
  * commands, read in this process.  The file is rewritten whole after each record.
  */
-static GString *breenix_attest_records;
+#define BREENIX_ATTEST_MAX_RECORDS 128
+static GQueue breenix_attest_records = G_QUEUE_INIT;
 static GHashTable *breenix_attest_submitted;
 
 static void breenix_attest_json_str(GString *out, const char *s)
@@ -587,7 +594,7 @@ static void breenix_attest_json_str(GString *out, const char *s)
         return;
     }
     g_string_append_c(out, '"');
-    for (; *s; s++) {
+    for (unsigned length = 0; *s && length < 1024; s++, length++) {
         unsigned char c = *s;
         if (c == '"' || c == '\\') {
             g_string_append_c(out, '\\');
@@ -624,13 +631,7 @@ static void breenix_attest_job(void *opaque)
         egl_vendor = eglQueryString(qemu_egl_display, EGL_VENDOR);
         egl_version = eglQueryString(qemu_egl_display, EGL_VERSION);
     }
-    if (!breenix_attest_records) {
-        breenix_attest_records = g_string_new(NULL);
-    }
-    rec = breenix_attest_records;
-    if (rec->len) {
-        g_string_append(rec, ",\n");
-    }
+    rec = g_string_new(NULL);
     g_string_append_printf(rec, "    {\"event\": \"%s\", \"ctx_id\": %u, "
                            "\"gl_vendor\": ", event, ctx_id);
     breenix_attest_json_str(rec, vendor);
@@ -644,16 +645,33 @@ static void breenix_attest_job(void *opaque)
     breenix_attest_json_str(rec, egl_version);
     g_string_append(rec, "}");
 
+    g_queue_push_tail(&breenix_attest_records, g_string_free(rec, false));
+    if (breenix_attest_records.length > BREENIX_ATTEST_MAX_RECORDS) {
+        g_free(g_queue_pop_head(&breenix_attest_records));
+    }
     doc = g_string_new(NULL);
     g_string_append_printf(doc, "{\n  \"format\": 1,\n  \"pid\": %d,\n"
-                           "  \"records\": [\n%s\n  ]\n}\n",
-                           (int)getpid(), rec->str);
+                           "  \"records\": [\n", (int)getpid());
+    for (GList *item = breenix_attest_records.head; item; item = item->next) {
+        g_string_append(doc, item->data);
+        g_string_append(doc, item->next ? ",\n" : "\n");
+    }
+    g_string_append(doc, "  ]\n}\n");
     tmp = g_strdup_printf("%s.tmp", path);
     if (!g_file_set_contents(tmp, doc->str, doc->len, NULL) ||
         rename(tmp, path) != 0) {
         error_report("virtio-gpu: cannot write %s", path);
     }
 }
+static void breenix_attest_reset(void *opaque G_GNUC_UNUSED)
+{
+    const char *path = getenv("BREENIX_HOST_RENDERER_JSON");
+    g_queue_clear_full(&breenix_attest_records, g_free);
+    if (path && *path) {
+        unlink(path);
+    }
+}
+
 static void breenix_attest(const char *event, uint32_t ctx_id)
 {
     BreenixAttest arg = { event, ctx_id };
@@ -857,7 +875,8 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
     if (!breenix_attest_submitted) {
         breenix_attest_submitted = g_hash_table_new(NULL, NULL);
     }
-    if (g_hash_table_add(breenix_attest_submitted,
+    if (g_hash_table_size(breenix_attest_submitted) < BREENIX_ATTEST_MAX_RECORDS &&
+        g_hash_table_add(breenix_attest_submitted,
                          GUINT_TO_POINTER(cs.hdr.ctx_id))) {
         breenix_attest("first-submit-3d", cs.hdr.ctx_id);
     }
@@ -1793,7 +1812,10 @@ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
 void virtio_gpu_virgl_reset(VirtIOGPU *g)
 {
     virgl_renderer_reset();
-
+    virtio_gpu_renderer_call(breenix_attest_reset, NULL);
+    if (breenix_attest_submitted) {
+        g_hash_table_remove_all(breenix_attest_submitted);
+    }
     virtio_gpu_virgl_reset_async_fences(g);
 }
 
@@ -1856,6 +1878,14 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 
+    if (breenix_renderer_share &&
+        (!(flags & VIRGL_RENDERER_ASYNC_FENCE_CB) ||
+         virtio_gpu_3d_cbs.write_fence != virgl_write_async_fence ||
+         virtio_gpu_3d_cbs.write_context_fence != virgl_write_async_context_fence)) {
+        error_report("renderer worker requires active async fence callbacks");
+        return -EINVAL;
+    }
+    gl->async_fence_enabled = (flags & VIRGL_RENDERER_ASYNC_FENCE_CB) != 0;
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
         error_report("virgl could not be initialized: %d", ret);

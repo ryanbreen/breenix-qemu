@@ -43,6 +43,10 @@ typedef struct { int unused; } BRW;
 #define VIRTIO_GPU_GL(p) ((VirtIOGPUGL *)(p))
 #define DEVICE(p) (p)
 #define RS_INIT_FAILED 3
+typedef struct Notifier { void (*notify)(struct Notifier *, void *); } Notifier;
+static Notifier renderer_exit_notifier;
+static void renderer_exit(Notifier *notifier, void *data) { (void)notifier; (void)data; }
+static void qemu_add_exit_notifier(Notifier *notifier) { (void)notifier; }
 static BRW *renderer_worker;
 static QEMUBH *renderer_done_bh;
 static Coroutine *renderer_co;
@@ -52,6 +56,8 @@ static void *breenix_renderer_share;
 static void *qemu_egl_display = (void *)1;
 static Coroutine *qemu_coroutine_self(void) { return &self_token; }
 static void main_loop_wait(bool unused) { (void)unused; exit(77); }
+static void aio_poll(void *ctx, bool blocking) { (void)ctx; main_loop_wait(blocking); }
+static void *iohandler_get_aio_context(void) { return NULL; }
 #define AIO_WAIT_WHILE(ctx, cond) do { while (cond) main_loop_wait(false); } while (0)
 QUIESCE
 static void reset_from_response(void) {

@@ -26,6 +26,7 @@
 #define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
 #include "qemu/main-loop.h"
+#include "block/aio.h"
 #include "qemu/coroutine.h"
 #include "system/cpus.h"
 #include "ui/egl-helpers.h"
@@ -40,6 +41,7 @@ static QEMUBH *renderer_done_bh;
 static Coroutine *renderer_co;
 static GQueue renderer_events = G_QUEUE_INIT;
 static bool renderer_quiescing;
+static Notifier renderer_exit_notifier;
 EGLContext breenix_renderer_share;
 
 typedef struct RendererCall {
@@ -84,7 +86,7 @@ static void renderer_retire_call(void *opaque)
 void virtio_gpu_renderer_call(void (*fn)(void *), void *arg)
 {
     RendererCall call = { .fn = fn, .arg = arg };
-    if (!renderer_worker || g_thread_self() == renderer_worker->thread) {
+    if (!renderer_worker || qemu_thread_is_self(&renderer_worker->thread)) {
         fn(arg);
         return;
     }
@@ -95,10 +97,9 @@ void virtio_gpu_renderer_call(void (*fn)(void *), void *arg)
     if (call.co) {
         qemu_coroutine_yield();
     } else {
-        /* Initialization, native texture release and drained teardown only.
-         * Dispatching the main loop also releases BQL around its poll. */
+        /* Only renderer completions are needed here, not a nested main loop. */
         while (!call.done) {
-            main_loop_wait(false);
+            aio_poll(iohandler_get_aio_context(), true);
         }
     }
     assert(call.done);
@@ -136,7 +137,9 @@ void virtio_gpu_renderer_release_handle(enum virgl_renderer_native_handle_type t
 
 static void renderer_flush(void *opaque G_GNUC_UNUSED)
 {
-    glFlush();
+    /* The pinned ANGLE Xcode build has no share-context lock. Complete
+     * producer work before the display context consumes its shared texture. */
+    glFinish();
 }
 
 void virtio_gpu_renderer_flush(void)
@@ -181,9 +184,21 @@ void virtio_gpu_gl_schedule(VirtIOGPU *g G_GNUC_UNUSED, void (*fn)(void *), void
 
 static void renderer_quiesce(void)
 {
+    /* A response must not reset its own transport while dispatching. The
+     * guarded completion BH prevents that MMIO re-entry; catch other callers. */
+    assert(!renderer_co || qemu_coroutine_self() != renderer_co);
     renderer_quiescing = true;
     while (renderer_co) {
-        main_loop_wait(false);
+        aio_poll(iohandler_get_aio_context(), true);
+    }
+}
+
+static void renderer_exit(Notifier *notifier, void *data)
+{
+    /* atexit precedes ANGLE/Metal's destructors. Do not resume guest work. */
+    renderer_quiescing = true;
+    if (renderer_worker) {
+        brw_stop(renderer_worker);
     }
 }
 
@@ -264,6 +279,9 @@ static void virtio_gpu_gl_ctrl_work(void *opaque)
         break;
     }
 
+    if (renderer_quiescing) {
+        return;
+    }
     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     while (cmd) {
         virtio_gpu_ctrl_cmd_init(cmd, vq);
@@ -288,8 +306,10 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         }
         /* This uncurrent shared context belongs to the worker. The display's
          * own root context and surfaces remain on their existing thread. */
-        renderer_done_bh = qemu_bh_new(renderer_done, NULL);
+        renderer_done_bh = virtio_bh_io_new_guarded(DEVICE(g), renderer_done, NULL);
         renderer_worker = brw_new(renderer_notify, renderer_done_bh);
+        renderer_exit_notifier.notify = renderer_exit;
+        qemu_add_exit_notifier(&renderer_exit_notifier);
 #ifdef CONFIG_DARWIN
         renderer_worker->execute = breenix_renderer_invoke;
 #endif
@@ -418,6 +438,7 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
     }
 
     if (renderer_worker) {
+        qemu_remove_exit_notifier(&renderer_exit_notifier);
         virtio_gpu_renderer_call(renderer_destroy_share, NULL);
         brw_stop(renderer_worker);
         brw_complete(renderer_worker);
@@ -446,6 +467,7 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, void *data)
     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
     vgc->resource_destroy = virtio_gpu_virgl_resource_destroy;
 
+    dc->hotpluggable = false;
     vdc->realize = virtio_gpu_gl_device_realize;
     vdc->unrealize = virtio_gpu_gl_device_unrealize;
     vdc->reset = virtio_gpu_gl_reset;

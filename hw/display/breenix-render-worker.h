@@ -2,6 +2,8 @@
 #ifndef BREENIX_RENDER_WORKER_H
 #define BREENIX_RENDER_WORKER_H
 #include <glib.h>
+#include "qemu/thread.h"
+#include <epoxy/egl.h>
 
 typedef struct BRWJob {
     void (*run)(void *);
@@ -11,7 +13,8 @@ typedef struct BRWJob {
 
 typedef struct BRW {
     GAsyncQueue *pending, *completed;
-    GThread *thread;
+    QemuThread thread;
+    bool running;
     void (*notify)(void *);
     void (*execute)(void (*)(void *), void *);
     void *opaque;
@@ -23,6 +26,7 @@ static inline gpointer brw_thread(gpointer opaque)
     for (;;) {
         BRWJob *job = g_async_queue_pop(w->pending);
         if ((void *)job == (void *)w) {
+            eglReleaseThread();
             return NULL;
         }
         if (w->execute) {
@@ -42,14 +46,16 @@ static inline BRW *brw_new(void (*notify)(void *), void *opaque)
     w->completed = g_async_queue_new();
     w->notify = notify;
     w->opaque = opaque;
-    w->thread = g_thread_new("virgl-renderer", brw_thread, w);
+    qemu_thread_create(&w->thread, "virgl-renderer", brw_thread, w,
+                       QEMU_THREAD_JOINABLE);
+    w->running = true;
     return w;
 }
 
 /* The submitter retains each job and all of its arguments until complete. */
 static inline void brw_submit(BRW *w, BRWJob *job)
 {
-    g_assert(w->thread != NULL);
+    g_assert(w->running);
     g_async_queue_push(w->pending, job);
 }
 
@@ -65,14 +71,16 @@ static inline void brw_complete(BRW *w)
 /* A FIFO barrier: all earlier calls finish before the thread exits. */
 static inline void brw_stop(BRW *w)
 {
-    g_async_queue_push(w->pending, w);
-    g_thread_join(w->thread);
-    w->thread = NULL;
+    if (w->running) {
+        g_async_queue_push(w->pending, w);
+        qemu_thread_join(&w->thread);
+        w->running = false;
+    }
 }
 
 static inline void brw_free(BRW *w)
 {
-    g_assert(w->thread == NULL);
+    g_assert(!w->running);
     g_assert(g_async_queue_length(w->pending) == 0);
     g_assert(g_async_queue_length(w->completed) == 0);
     g_async_queue_unref(w->pending);

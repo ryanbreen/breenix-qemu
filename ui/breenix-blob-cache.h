@@ -19,7 +19,7 @@ static int bbc_lock = -1;
 static inline bool bbc_enter(void)
 {
     g_mutex_lock(&bbc_mutex);
-    if (bbc_lock >= 0 && flock(bbc_lock, LOCK_EX) == 0) {
+    if (bbc_lock >= 0 && flock(bbc_lock, LOCK_EX | LOCK_NB) == 0) {
         return true;
     }
     g_mutex_unlock(&bbc_mutex);
@@ -86,6 +86,8 @@ static EGLsizeiANDROID bbc_get(const void *key, EGLsizeiANDROID key_size,
         result = length;
         if (value && value_size >= result) {
             memcpy(value, bytes + key_size + 64, result);
+            /* Evict by last successful use, not the original insertion. */
+            futimens(fd, NULL);
         }
     }
     g_free(digest);
@@ -110,7 +112,7 @@ static inline void bbc_entry_free(gpointer opaque)
     g_free(e->path);
     g_free(e);
 }
-static inline bool bbc_reserve(size_t incoming)
+static inline bool bbc_reserve(const char *replacing, size_t incoming)
 {
     GDir *dir = g_dir_open(bbc_directory, 0, NULL);
     GPtrArray *entries = g_ptr_array_new_with_free_func(bbc_entry_free);
@@ -135,6 +137,11 @@ static inline bool bbc_reserve(size_t incoming)
         }
         path = g_build_filename(bbc_directory, name, NULL);
         if (lstat(path, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+            g_free(path);
+            continue;
+        }
+        if (!strcmp(path, replacing)) {
+            /* rename replaces this record; do not count both versions. */
             g_free(path);
             continue;
         }
@@ -168,10 +175,10 @@ static void bbc_set(const void *key, EGLsizeiANDROID key_size,
         return;
     }
     length = key_size + 64 + value_size;
-    if (!bbc_reserve(length)) {
+    path = bbc_path(key, key_size);
+    if (!bbc_reserve(path, length)) {
         goto out;
     }
-    path = bbc_path(key, key_size);
     temporary = g_build_filename(bbc_directory, ".tmp-XXXXXX", NULL);
     fd = g_mkstemp_full(temporary, O_WRONLY | O_CLOEXEC, 0600);
     if (fd < 0) {
@@ -217,7 +224,12 @@ static void breenix_blob_cache_install(EGLDisplay display, const char *pin)
     struct stat st;
     char *identity, *hash, *lock_path;
     PFNEGLSETBLOBCACHEFUNCSANDROIDPROC set_blob_cache_funcs;
-    if (bbc_directory || !epoxy_has_egl_extension(display, "EGL_ANDROID_blob_cache")) {
+    size_t base_size;
+    if (bbc_directory) {
+        return;
+    }
+    if (!epoxy_has_egl_extension(display, "EGL_ANDROID_blob_cache")) {
+        g_message("egl: EGL_ANDROID_blob_cache unavailable; program cache disabled");
         return;
     }
     /* Epoxy's extension dispatch checks the current display, but no context
@@ -229,7 +241,8 @@ static void breenix_blob_cache_install(EGLDisplay display, const char *pin)
         g_message("egl: eglSetBlobCacheFuncsANDROID unavailable; program cache disabled");
         return;
     }
-    if (confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base)) == 0) {
+    base_size = confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base));
+    if (base_size == 0 || base_size > sizeof(base)) {
         return;
     }
     identity = g_strdup_printf("%s:%s:%s", pin,
