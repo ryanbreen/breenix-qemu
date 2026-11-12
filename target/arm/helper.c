@@ -23,6 +23,7 @@
 #include "exec/translation-block.h"
 #include "hw/irq.h"
 #include "system/cpu-timers.h"
+#include "system/hvf.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "qapi/error.h"
@@ -1063,6 +1064,26 @@ static bool pmu_counter_enabled(CPUARMState *env, uint8_t counter)
         filtered = m != p;
     }
 
+    if (hvf_enabled()) {
+        /*
+         * Under HVF the vCPU runs unobserved between traps: EL changes are
+         * invisible, so per-EL filtering cannot be honoured, and evaluating
+         * the filter at trap-time EL is biased -- counters are programmed
+         * from EL1, so an EL0-only filter (perf's cycles:u) would read as
+         * permanently disabled here and a sampling session would silently
+         * record nothing.  Count unless the filter excludes every EL the
+         * guest can run at, and leave attributing samples to the guest's
+         * view of the interrupted PC.
+         */
+        bool el0_filtered = secure ? u : u != nsu;
+        bool el1_filtered = secure ? p : p != nsk;
+
+        filtered = el0_filtered && el1_filtered;
+        if (arm_feature(env, ARM_FEATURE_EL2)) {
+            filtered = filtered && !nsh;
+        }
+    }
+
     if (counter != 31) {
         /*
          * If not checking PMCCNTR, ensure the counter is setup to an event we
@@ -1243,6 +1264,17 @@ static void pmevcntr_op_finish(CPUARMState *env, uint8_t counter)
 void pmu_op_start(CPUARMState *env)
 {
     unsigned int i;
+
+    /*
+     * The HVF PMCCNTR_EL0 read fast path reads the counter state from the
+     * vCPU thread without the BQL, while pmccntr_op_start() transiently
+     * stores the raw cycle count in c15_ccnt_delta and arm_pmu_timer_cb()
+     * runs this on the main-loop thread.  Flag the whole span -- including
+     * whatever the caller mutates before pmu_op_finish() -- as a write in
+     * progress so the reader can detect it and retry.  Every caller holds
+     * the BQL, which serializes the write side.
+     */
+    seqlock_write_begin(&env_archcpu(env)->pmu_op_lock);
     pmccntr_op_start(env);
     for (i = 0; i < pmu_num_counters(env); i++) {
         pmevcntr_op_start(env, i);
@@ -1255,6 +1287,24 @@ void pmu_op_finish(CPUARMState *env)
     pmccntr_op_finish(env);
     for (i = 0; i < pmu_num_counters(env); i++) {
         pmevcntr_op_finish(env, i);
+    }
+    seqlock_write_end(&env_archcpu(env)->pmu_op_lock);
+}
+
+void pmu_evcntr_delta_rebaseline(CPUARMState *env)
+{
+    unsigned int i;
+
+    /* Mirrors what pmevtyper_rawwrite() does for a single counter */
+    for (i = 0; i < pmu_num_counters(env); i++) {
+        uint16_t event = env->cp15.c14_pmevtyper[i] & PMXEVTYPER_EVTCOUNT;
+
+        if (event_supported(event)) {
+            uint16_t event_idx = supported_event_map[event];
+
+            env->cp15.c14_pmevcntr_delta[i] =
+                pm_events[event_idx].get_count(env);
+        }
     }
 }
 
@@ -1303,6 +1353,13 @@ static void pmcr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     env->cp15.c9_pmcr |= (value & PMCR_WRITABLE_MASK);
 
     pmu_op_finish(env);
+
+    /*
+     * PMCR_EL0.E gates the overflow interrupt line (see the ARM ARM's
+     * CheckForPMUOverflow() pseudocode): re-evaluate it, or toggling E with
+     * PMOVSR and PMINTEN already set leaves the level-triggered PPI stale.
+     */
+    pmu_update_irq(env);
 }
 
 static uint64_t pmcr_read(CPUARMState *env, const ARMCPRegInfo *ri)

@@ -11,6 +11,9 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
+#include "hw/intc/arm_gic_common.h"
+#include "hw/intc/arm_gicv3_common.h"
 #include "qemu/log.h"
 #include <dlfcn.h>
 #include <AvailabilityMacros.h>
@@ -199,14 +202,65 @@ void hvf_arm_init_debug(void)
 #define SYSREG_PMUSERENR_EL0  SYSREG(3, 3, 9, 14, 0)
 #define SYSREG_PMCNTENSET_EL0 SYSREG(3, 3, 9, 12, 1)
 #define SYSREG_PMCNTENCLR_EL0 SYSREG(3, 3, 9, 12, 2)
+#define SYSREG_PMINTENSET_EL1 SYSREG(3, 0, 9, 14, 1)
 #define SYSREG_PMINTENCLR_EL1 SYSREG(3, 0, 9, 14, 2)
 #define SYSREG_PMOVSCLR_EL0   SYSREG(3, 3, 9, 12, 3)
+#define SYSREG_PMOVSSET_EL0   SYSREG(3, 3, 9, 14, 3)
 #define SYSREG_PMSWINC_EL0    SYSREG(3, 3, 9, 12, 4)
 #define SYSREG_PMSELR_EL0     SYSREG(3, 3, 9, 12, 5)
 #define SYSREG_PMCEID0_EL0    SYSREG(3, 3, 9, 12, 6)
 #define SYSREG_PMCEID1_EL0    SYSREG(3, 3, 9, 12, 7)
 #define SYSREG_PMCCNTR_EL0    SYSREG(3, 3, 9, 13, 0)
+#define SYSREG_PMXEVTYPER_EL0 SYSREG(3, 3, 9, 13, 1)
+#define SYSREG_PMXEVCNTR_EL0  SYSREG(3, 3, 9, 13, 2)
 #define SYSREG_PMCCFILTR_EL0  SYSREG(3, 3, 14, 15, 7)
+
+/*
+ * PMEVCNTR<n>_EL0:  op0=3 op1=3 crn=14 crm=0b10:n<4:3> op2=n<2:0>
+ * PMEVTYPER<n>_EL0: op0=3 op1=3 crn=14 crm=0b11:n<4:3> op2=n<2:0>
+ * for n = 0..30 (the would-be n = 31 typer encoding is PMCCFILTR_EL0,
+ * which has its own case; the n = 31 counter encoding is unallocated).
+ */
+static bool sysreg_is_pmev(uint32_t reg)
+{
+    unsigned n;
+
+    if (SYSREG_OP0(reg) != 3 || SYSREG_OP1(reg) != 3 ||
+        SYSREG_CRN(reg) != 14 || SYSREG_CRM(reg) < 8) {
+        return false;
+    }
+    n = (SYSREG_CRM(reg) & 3) * 8 + SYSREG_OP2(reg);
+    return n <= 30;
+}
+
+/*
+ * The PMUv3 registers this file routes to the QEMU PMU model's cpreg
+ * handlers (helper.c define_pmu_regs() and friends).
+ */
+static bool sysreg_is_pmu(uint32_t reg)
+{
+    switch (reg) {
+    case SYSREG_PMCR_EL0:
+    case SYSREG_PMUSERENR_EL0:
+    case SYSREG_PMCNTENSET_EL0:
+    case SYSREG_PMCNTENCLR_EL0:
+    case SYSREG_PMINTENSET_EL1:
+    case SYSREG_PMINTENCLR_EL1:
+    case SYSREG_PMOVSCLR_EL0:
+    case SYSREG_PMOVSSET_EL0:
+    case SYSREG_PMSWINC_EL0:
+    case SYSREG_PMSELR_EL0:
+    case SYSREG_PMCEID0_EL0:
+    case SYSREG_PMCEID1_EL0:
+    case SYSREG_PMCCNTR_EL0:
+    case SYSREG_PMXEVTYPER_EL0:
+    case SYSREG_PMXEVCNTR_EL0:
+    case SYSREG_PMCCFILTR_EL0:
+        return true;
+    default:
+        return sysreg_is_pmev(reg);
+    }
+}
 
 #define SYSREG_ICC_AP0R0_EL1     SYSREG(3, 0, 12, 8, 4)
 #define SYSREG_ICC_AP0R1_EL1     SYSREG(3, 0, 12, 8, 5)
@@ -930,6 +984,26 @@ static bool hvf_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
      */
     host_isar.id_aa64pfr1 &= ~R_ID_AA64PFR1_SME_MASK;
 
+    /*
+     * Apple silicon has no architected PMUv3 (the host's
+     * ID_AA64DFR0_EL1.PMUVer is 0); every PMU register access from the
+     * guest traps and QEMU emulates the whole unit, counting cycles on the
+     * virtual clock (helper.c pm_events) and raising the overflow PPI from
+     * the pmu_timer.  Advertise base PMUv3 with six event counters so
+     * guests get a real sampling source (Windows' ETW profiler refuses to
+     * sample with PMUVer == 0; note Windows reads PMCCNTR_EL0 even with
+     * PMUVer == 0, so -cpu host,pmu=off cannot boot it).  PMUVER lands in
+     * the vCPU's ID_AA64DFR0_EL1 via the cpreg resetvalue that
+     * hvf_put_registers() pushes before the first run (realize zeroes it
+     * again for pmu=off); PMCR_EL0.N comes from reset_pmcr_el0 via the
+     * PMCR cpreg resetvalue and pmu_num_counters().  PMCR_EL0.{IMP,IDCODE}
+     * are left 0 like the TCG CPUs that don't model a specific
+     * implementation's PMU.
+     */
+    host_isar.id_aa64dfr0 = FIELD_DP64(host_isar.id_aa64dfr0, ID_AA64DFR0,
+                                       PMUVER, 1);
+    host_isar.reset_pmcr_el0 = 6 << PMCRN_SHIFT;    /* six event counters */
+
     ahcf->isar = host_isar;
 
     /*
@@ -1152,6 +1226,390 @@ cleanup:
     return ret;
 }
 
+/*
+ * Hypervisor.framework in-kernel GICv3 (macOS 15+).  With it, SGIs, the
+ * timer PPIs and every GIC register access stay in the kernel; QEMU only
+ * feeds SPIs in and pends the PPIs it raises itself (the emulated PMU).
+ * The hv_gic_* API only exists on macOS; other Apple platforms get stubs
+ * that never advertise an in-kernel irqchip.
+ */
+#if TARGET_OS_OSX
+
+static struct {
+    bool created;
+    hwaddr dist_base;
+    hwaddr redist_base;
+} hvf_gic;
+
+bool hvf_arch_kernel_irqchip_available(void)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        return true;
+    }
+    return false;
+}
+
+bool hvf_arm_gic_created(void)
+{
+    return hvf_gic.created;
+}
+
+void hvf_arm_gic_create(hwaddr dist_base, hwaddr redist_base,
+                        hwaddr redist_size, unsigned max_cpus,
+                        unsigned num_spi, Error **errp)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        size_t dist_align, redist_align, redist_stride;
+        uint32_t spi_base, spi_count;
+        hv_gic_config_t config;
+        hv_return_t ret;
+
+        if (hvf_gic.created) {
+            error_setg(errp, "the HVF in-kernel GIC was already created");
+            return;
+        }
+        assert_hvf_ok(hv_gic_get_distributor_base_alignment(&dist_align));
+        assert_hvf_ok(hv_gic_get_redistributor_base_alignment(&redist_align));
+        assert_hvf_ok(hv_gic_get_redistributor_size(&redist_stride));
+        assert_hvf_ok(hv_gic_get_spi_interrupt_range(&spi_base, &spi_count));
+
+        if (dist_base & (dist_align - 1)) {
+            error_setg(errp, "GIC distributor base 0x%" HWADDR_PRIx
+                       " is not %zu-byte aligned", dist_base, dist_align);
+            return;
+        }
+        if (redist_base & (redist_align - 1)) {
+            error_setg(errp, "GIC redistributor base 0x%" HWADDR_PRIx
+                       " is not %zu-byte aligned", redist_base, redist_align);
+            return;
+        }
+        if ((hwaddr)max_cpus * redist_stride > redist_size) {
+            error_setg(errp, "GIC redistributor region (0x%" HWADDR_PRIx
+                       " bytes) holds %" HWADDR_PRIu " of the %u vCPUs",
+                       redist_size, redist_size / redist_stride, max_cpus);
+            return;
+        }
+        if (spi_base > GIC_INTERNAL ||
+            spi_base + spi_count < GIC_INTERNAL + num_spi) {
+            error_setg(errp, "HVF in-kernel GIC supports SPIs %u-%u, the "
+                       "board needs %u-%u", spi_base, spi_base + spi_count - 1,
+                       GIC_INTERNAL, GIC_INTERNAL + num_spi - 1);
+            return;
+        }
+
+        config = hv_gic_config_create();
+        assert_hvf_ok(hv_gic_config_set_distributor_base(config, dist_base));
+        assert_hvf_ok(hv_gic_config_set_redistributor_base(config,
+                                                           redist_base));
+        ret = hv_gic_create(config);
+        os_release(config);
+        if (ret != HV_SUCCESS) {
+            error_setg(errp, "hv_gic_create failed: 0x%x", (unsigned)ret);
+            return;
+        }
+        hvf_gic.created = true;
+        hvf_gic.dist_base = dist_base;
+        hvf_gic.redist_base = redist_base;
+        info_report("HVF: in-kernel GICv3 (dist 0x%" HWADDR_PRIx ", redist 0x%"
+                    HWADDR_PRIx ", SPIs %u-%u)", dist_base, redist_base,
+                    GIC_INTERNAL, GIC_INTERNAL + num_spi - 1);
+        return;
+    }
+    error_setg(errp, "the HVF in-kernel GIC needs macOS 15 or newer");
+}
+
+/*
+ * hv_gic_set_spi() makes the interrupt pending but does not force a vCPU
+ * that is currently running guest code to re-evaluate its pending state:
+ * the interrupt is only taken at that vCPU's next exit, which for a guest
+ * busy in user code can be a timer tick away.  Look up the SPI's affinity
+ * route and exit that vCPU so it re-enters with the interrupt; a 1-of-N
+ * route (IRM set) exits every vCPU.
+ */
+static void hvf_arm_gic_kick_spi_target(uint32_t intid)
+{
+    const uint64_t aff_mask = 0xff00ffffffULL;   /* Aff3 | Aff2 | Aff1 | Aff0 */
+    hv_vcpu_t ids[128];
+    unsigned n = 0;
+    uint64_t router = 1ULL << 31;
+    CPUState *cs;
+
+    if (__builtin_available(macOS 15.0, *)) {
+        hv_gic_get_distributor_reg(HV_GIC_DISTRIBUTOR_REG_GICD_IROUTER32 +
+                                   (intid - GIC_INTERNAL) * 8, &router);
+    }
+    CPU_FOREACH(cs) {
+        if (!cs->accel || n == ARRAY_SIZE(ids)) {
+            continue;
+        }
+        if ((router & (1ULL << 31)) ||
+            ARM_CPU(cs)->mp_affinity == (router & aff_mask)) {
+            ids[n++] = cs->accel->fd;
+        }
+    }
+    if (n) {
+        hv_vcpus_exit(ids, n);
+    }
+}
+
+void hvf_arm_gic_set_spi(uint32_t intid, int level)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        assert_hvf_ok(hv_gic_set_spi(intid, level != 0));
+        if (level) {
+            hvf_arm_gic_kick_spi_target(intid);
+        }
+    }
+}
+
+/*
+ * A PPI's redistributor is only writable from the owning vCPU thread, so
+ * record the change and let hvf_arm_gic_flush_ppis() apply it right before
+ * the next hv_vcpu_run().
+ */
+void hvf_arm_gic_set_ppi(CPUState *cpu, uint32_t intid, int level)
+{
+    AccelCPUState *acc = cpu->accel;
+    uint32_t bit = 1u << intid;
+
+    if (!acc) {
+        return;
+    }
+    if (level) {
+        qatomic_and(&acc->gic_ppi_clear, ~bit);
+        qatomic_or(&acc->gic_ppi_set, bit);
+    } else {
+        qatomic_and(&acc->gic_ppi_set, ~bit);
+        qatomic_or(&acc->gic_ppi_clear, bit);
+    }
+    if (cpu != current_cpu) {
+        qemu_cpu_kick(cpu);
+    }
+}
+
+static void hvf_arm_gic_flush_ppis(CPUState *cpu)
+{
+    AccelCPUState *acc = cpu->accel;
+    uint32_t set, clear;
+
+    if (!hvf_irqchip_in_kernel() ||
+        (!qatomic_read(&acc->gic_ppi_set) &&
+         !qatomic_read(&acc->gic_ppi_clear))) {
+        return;
+    }
+    set = qatomic_xchg(&acc->gic_ppi_set, 0);
+    clear = qatomic_xchg(&acc->gic_ppi_clear, 0);
+    if (__builtin_available(macOS 15.0, *)) {
+        if (clear) {
+            assert_hvf_ok(hv_gic_set_redistributor_reg(acc->fd,
+                              HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, clear));
+        }
+        if (set) {
+            assert_hvf_ok(hv_gic_set_redistributor_reg(acc->fd,
+                              HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, set));
+        }
+    }
+}
+
+void hvf_arm_gic_reset(void)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        if (hvf_gic.created) {
+            assert_hvf_ok(hv_gic_reset());
+        }
+    }
+}
+
+/*
+ * hv_gic_state_* serialize the distributor and the redistributors as an
+ * opaque, versioned blob; the CPU interfaces are not part of it.  Their
+ * ICC_* registers are only reachable from the owning vCPU thread and are
+ * carried in the GICv3CPUState fields the other GICv3 models use, in the
+ * order KVM restores them (SRE first, it changes what the rest mean).
+ */
+static uint64_t *hvf_arm_gic_icc_field(GICv3CPUState *c, unsigned i,
+                                       hv_gic_icc_reg_t *reg)
+    API_AVAILABLE(macos(15.0))
+{
+    switch (i) {
+    case 0:
+        *reg = HV_GIC_ICC_REG_SRE_EL1;
+        return &c->icc_sre_el1;
+    case 1:
+        *reg = HV_GIC_ICC_REG_CTLR_EL1;
+        return &c->icc_ctlr_el1[GICV3_NS];
+    case 2:
+        *reg = HV_GIC_ICC_REG_PMR_EL1;
+        return &c->icc_pmr_el1;
+    case 3:
+        *reg = HV_GIC_ICC_REG_BPR0_EL1;
+        return &c->icc_bpr[GICV3_G0];
+    case 4:
+        *reg = HV_GIC_ICC_REG_BPR1_EL1;
+        return &c->icc_bpr[GICV3_G1NS];
+    case 5:
+        *reg = HV_GIC_ICC_REG_AP0R0_EL1;
+        return &c->icc_apr[GICV3_G0][0];
+    case 6:
+        *reg = HV_GIC_ICC_REG_AP1R0_EL1;
+        return &c->icc_apr[GICV3_G1NS][0];
+    case 7:
+        *reg = HV_GIC_ICC_REG_IGRPEN0_EL1;
+        return &c->icc_igrpen[GICV3_G0];
+    case 8:
+        *reg = HV_GIC_ICC_REG_IGRPEN1_EL1;
+        return &c->icc_igrpen[GICV3_G1NS];
+    default:
+        return NULL;
+    }
+}
+
+static void hvf_arm_gic_get_icc(CPUState *cpu, run_on_cpu_data arg)
+{
+    GICv3CPUState *c = arg.host_ptr;
+    hv_gic_icc_reg_t reg;
+    uint64_t *field;
+
+    if (__builtin_available(macOS 15.0, *)) {
+        for (unsigned i = 0; (field = hvf_arm_gic_icc_field(c, i, &reg)); i++) {
+            assert_hvf_ok(hv_gic_get_icc_reg(cpu->accel->fd, reg, field));
+        }
+    }
+}
+
+static void hvf_arm_gic_set_icc(CPUState *cpu, run_on_cpu_data arg)
+{
+    GICv3CPUState *c = arg.host_ptr;
+    hv_gic_icc_reg_t reg;
+    uint64_t *field;
+
+    if (__builtin_available(macOS 15.0, *)) {
+        for (unsigned i = 0; (field = hvf_arm_gic_icc_field(c, i, &reg)); i++) {
+            assert_hvf_ok(hv_gic_set_icc_reg(cpu->accel->fd, reg, *field));
+        }
+    }
+}
+
+void hvf_arm_gic_save_cpu_state(GICv3State *s)
+{
+    for (unsigned i = 0; i < s->num_cpu; i++) {
+        run_on_cpu(s->cpu[i].cpu, hvf_arm_gic_get_icc,
+                   RUN_ON_CPU_HOST_PTR(&s->cpu[i]));
+    }
+}
+
+int hvf_arm_gic_save_state(GICv3State *s, Error **errp)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        hv_gic_state_t state;
+        size_t size;
+        hv_return_t ret;
+
+        /* only valid while every vCPU is stopped, which the save ensures */
+        state = hv_gic_state_create();
+        if (!state) {
+            error_setg(errp, "the HVF in-kernel GIC state cannot be saved");
+            return -1;
+        }
+        ret = hv_gic_state_get_size(state, &size);
+        if (ret == HV_SUCCESS && size > UINT32_MAX) {
+            ret = HV_NO_RESOURCES;
+        }
+        if (ret == HV_SUCCESS) {
+            s->kernel_state = g_malloc(size);
+            s->kernel_state_size = size;
+            ret = hv_gic_state_get_data(state, s->kernel_state);
+        }
+        os_release(state);
+        if (ret != HV_SUCCESS) {
+            g_clear_pointer(&s->kernel_state, g_free);
+            s->kernel_state_size = 0;
+            error_setg(errp, "saving the HVF in-kernel GIC state failed: %s",
+                       hvf_return_string(ret));
+            return -1;
+        }
+        return 0;
+    }
+    error_setg(errp, "the HVF in-kernel GIC needs macOS 15 or newer");
+    return -1;
+}
+
+int hvf_arm_gic_load_state(GICv3State *s, Error **errp)
+{
+    if (__builtin_available(macOS 15.0, *)) {
+        hv_return_t ret;
+
+        /* the blob first: the CPU interfaces are restored on top of it */
+        ret = hv_gic_set_state(s->kernel_state, s->kernel_state_size);
+        if (ret != HV_SUCCESS) {
+            error_setg(errp, "restoring the HVF in-kernel GIC state failed: "
+                       "%s (saved by an incompatible host?)",
+                       hvf_return_string(ret));
+            return -1;
+        }
+        for (unsigned i = 0; i < s->num_cpu; i++) {
+            run_on_cpu(s->cpu[i].cpu, hvf_arm_gic_set_icc,
+                       RUN_ON_CPU_HOST_PTR(&s->cpu[i]));
+        }
+        return 0;
+    }
+    error_setg(errp, "the HVF in-kernel GIC needs macOS 15 or newer");
+    return -1;
+}
+
+#else /* !TARGET_OS_OSX */
+
+bool hvf_arch_kernel_irqchip_available(void)
+{
+    return false;
+}
+
+bool hvf_arm_gic_created(void)
+{
+    return false;
+}
+
+void hvf_arm_gic_create(hwaddr dist_base, hwaddr redist_base,
+                        hwaddr redist_size, unsigned max_cpus,
+                        unsigned num_spi, Error **errp)
+{
+    error_setg(errp, "the HVF in-kernel GIC is only available on macOS");
+}
+
+void hvf_arm_gic_set_spi(uint32_t intid, int level)
+{
+}
+
+void hvf_arm_gic_set_ppi(CPUState *cpu, uint32_t intid, int level)
+{
+}
+
+static void hvf_arm_gic_flush_ppis(CPUState *cpu)
+{
+}
+
+void hvf_arm_gic_reset(void)
+{
+}
+
+void hvf_arm_gic_save_cpu_state(GICv3State *s)
+{
+}
+
+int hvf_arm_gic_save_state(GICv3State *s, Error **errp)
+{
+    error_setg(errp, "the HVF in-kernel GIC is only available on macOS");
+    return -1;
+}
+
+int hvf_arm_gic_load_state(GICv3State *s, Error **errp)
+{
+    error_setg(errp, "the HVF in-kernel GIC is only available on macOS");
+    return -1;
+}
+
+#endif /* TARGET_OS_OSX */
+
 int hvf_arch_init_vcpu(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -1209,9 +1667,16 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 
     ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, &pfr);
     assert_hvf_ok(ret);
-    pfr |= env->gicv3state ? (1 << 24) : 0;
+    pfr |= (env->gicv3state || hvf_irqchip_in_kernel()) ? (1 << 24) : 0;
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, pfr);
     assert_hvf_ok(ret);
+
+    /*
+     * ID_AA64DFR0_EL1 (which carries the emulated PMU's PMUVer, including
+     * the 0 of -cpu host,pmu=off) needs no manual sync: it is in
+     * hvf_sreg_match[], so hvf_put_registers() pushes the model's value
+     * from the cpreg resetvalue before the first run.
+     */
 
     /* We're limited to underlying hardware caps, override internal versions */
     ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64MMFR0_EL1,
@@ -1242,7 +1707,21 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 
 void hvf_kick_vcpu_thread(CPUState *cpu)
 {
-    cpus_kick_thread(cpu);
+    /*
+     * Do not use cpus_kick_thread(): its thread_kicked dedup races with
+     * hvf_wait_for_ipi() clearing thread_kicked right before an unbounded
+     * pselect(). A kick that is skipped because thread_kicked was still set
+     * from an already-consumed kick is lost forever: the vCPU sleeps in WFI
+     * with the interrupt (or stop request) pending, which delays guest
+     * interrupts indefinitely and deadlocks pause_all_vcpus() on guest
+     * reset (zombie VM). Always send the signal.
+     */
+    qatomic_set(&cpu->thread_kicked, true);
+    int err = pthread_kill(cpu->thread->thread, SIG_IPI);
+    if (err && err != ESRCH) {
+        fprintf(stderr, "qemu:%s: %s", __func__, strerror(err));
+        exit(1);
+    }
     hv_vcpus_exit(&cpu->accel->fd, 1);
 }
 
@@ -1441,48 +1920,80 @@ static bool hvf_sysreg_read_cp(CPUState *cpu, uint32_t reg, uint64_t *val)
     return false;
 }
 
-static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
+/*
+ * Route a PMUv3 register access to the QEMU PMU model's cpreg handlers.
+ *
+ * Unlike most cpregs (see the GICv3 note at the hvf_sysreg_read_cp() call
+ * sites), the PMU handlers are safe to call from here: they only touch the
+ * cp15 state, the pmu_timer and the overflow interrupt line, and never
+ * need a TCG context.  Routing through them keeps HVF on the same
+ * implementation TCG uses -- per-EL access checks (PMUSERENR_EL0),
+ * per-counter start/finish bracketing, the pre-FEAT_PMUv3p5 RES0 masking
+ * of event counters, and the delta re-baselining when an event type
+ * changes.
+ *
+ * The caller has refreshed env->pstate (hvf_sync_pstate()), so
+ * arm_current_el() is accurate for the access checks.
+ */
+static int hvf_sysreg_access_pmu(CPUState *cpu, uint32_t reg, uint64_t *val,
+                                 bool isread, uint64_t syndrome)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    const ARMCPRegInfo *ri;
+    CPAccessResult res;
+
+    ri = get_arm_cp_reginfo(arm_cpu->cp_regs, hvf_reg2cp_reg(reg));
+    if (!ri || !cp_access_ok(arm_current_el(env), ri, isread)) {
+        /*
+         * No cpreg (an unimplemented counter index: PMEVCNTR<n>_EL0 with
+         * n >= PMCR_EL0.N) or a wrong-EL/wrong-direction access: UNDEF,
+         * as under TCG.
+         */
+        cpu_synchronize_state(cpu);
+        hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized());
+        return 1;
+    }
+
+    res = ri->accessfn ? ri->accessfn(env, ri, isread) : CP_ACCESS_OK;
+    if (res != CP_ACCESS_OK) {
+        /*
+         * Mirror TCG's access_check_cp_reg(): a configurable trap (EL0
+         * denied by PMUSERENR_EL0) presents the sysreg-trap syndrome and
+         * CP_ACCESS_UNDEFINED is uncategorized.  Without EL2/EL3 the only
+         * reachable target is EL1, which hvf_raise_exception() assumes.
+         */
+        cpu_synchronize_state(cpu);
+        hvf_raise_exception(cpu, EXCP_UDEF,
+                            res == CP_ACCESS_UNDEFINED ? syn_uncategorized() :
+                                                         (uint32_t)syndrome);
+        return 1;
+    }
+
+    if (isread) {
+        if (ri->type & ARM_CP_CONST) {
+            *val = ri->resetvalue;
+        } else if (ri->readfn) {
+            *val = ri->readfn(env, ri);
+        } else {
+            *val = CPREG_FIELD64(env, ri);
+        }
+    } else if (ri->writefn) {
+        ri->writefn(env, ri, *val);
+    } else {
+        CPREG_FIELD64(env, ri) = *val;
+    }
+    return 0;
+}
+
+static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t syndrome,
+                           uint64_t *val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
 
-    if (arm_feature(env, ARM_FEATURE_PMU)) {
-        switch (reg) {
-        case SYSREG_PMCR_EL0:
-            *val = env->cp15.c9_pmcr;
-            return 0;
-        case SYSREG_PMCCNTR_EL0:
-            pmu_op_start(env);
-            *val = env->cp15.c15_ccnt;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMCNTENCLR_EL0:
-            *val = env->cp15.c9_pmcnten;
-            return 0;
-        case SYSREG_PMOVSCLR_EL0:
-            *val = env->cp15.c9_pmovsr;
-            return 0;
-        case SYSREG_PMSELR_EL0:
-            *val = env->cp15.c9_pmselr;
-            return 0;
-        case SYSREG_PMINTENCLR_EL1:
-            *val = env->cp15.c9_pminten;
-            return 0;
-        case SYSREG_PMCCFILTR_EL0:
-            *val = env->cp15.pmccfiltr_el0;
-            return 0;
-        case SYSREG_PMCNTENSET_EL0:
-            *val = env->cp15.c9_pmcnten;
-            return 0;
-        case SYSREG_PMUSERENR_EL0:
-            *val = env->cp15.c9_pmuserenr;
-            return 0;
-        case SYSREG_PMCEID0_EL0:
-        case SYSREG_PMCEID1_EL0:
-            /* We can't really count anything yet, declare all events invalid */
-            *val = 0;
-            return 0;
-        }
+    if (arm_feature(env, ARM_FEATURE_PMU) && sysreg_is_pmu(reg)) {
+        return hvf_sysreg_access_pmu(cpu, reg, val, true, syndrome);
     }
 
     switch (reg) {
@@ -1618,82 +2129,6 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
     return 1;
 }
 
-static void pmu_update_irq(CPUARMState *env)
-{
-    ARMCPU *cpu = env_archcpu(env);
-    qemu_set_irq(cpu->pmu_interrupt, (env->cp15.c9_pmcr & PMCRE) &&
-            (env->cp15.c9_pminten & env->cp15.c9_pmovsr));
-}
-
-static bool pmu_event_supported(uint16_t number)
-{
-    return false;
-}
-
-/* Returns true if the counter (pass 31 for PMCCNTR) should count events using
- * the current EL, security state, and register configuration.
- */
-static bool pmu_counter_enabled(CPUARMState *env, uint8_t counter)
-{
-    uint64_t filter;
-    bool enabled, filtered = true;
-    int el = arm_current_el(env);
-
-    enabled = (env->cp15.c9_pmcr & PMCRE) &&
-              (env->cp15.c9_pmcnten & (1 << counter));
-
-    if (counter == 31) {
-        filter = env->cp15.pmccfiltr_el0;
-    } else {
-        filter = env->cp15.c14_pmevtyper[counter];
-    }
-
-    if (el == 0) {
-        filtered = filter & PMXEVTYPER_U;
-    } else if (el == 1) {
-        filtered = filter & PMXEVTYPER_P;
-    }
-
-    if (counter != 31) {
-        /*
-         * If not checking PMCCNTR, ensure the counter is setup to an event we
-         * support
-         */
-        uint16_t event = filter & PMXEVTYPER_EVTCOUNT;
-        if (!pmu_event_supported(event)) {
-            return false;
-        }
-    }
-
-    return enabled && !filtered;
-}
-
-static void pmswinc_write(CPUARMState *env, uint64_t value)
-{
-    unsigned int i;
-    for (i = 0; i < pmu_num_counters(env); i++) {
-        /* Increment a counter's count iff: */
-        if ((value & (1 << i)) && /* counter's bit is set */
-                /* counter is enabled and not filtered */
-                pmu_counter_enabled(env, i) &&
-                /* counter is SW_INCR */
-                (env->cp15.c14_pmevtyper[i] & PMXEVTYPER_EVTCOUNT) == 0x0) {
-            /*
-             * Detect if this write causes an overflow since we can't predict
-             * PMSWINC overflows like we can for other events
-             */
-            uint32_t new_pmswinc = env->cp15.c14_pmevcntr[i] + 1;
-
-            if (env->cp15.c14_pmevcntr[i] & ~new_pmswinc & INT32_MIN) {
-                env->cp15.c9_pmovsr |= (1 << i);
-                pmu_update_irq(env);
-            }
-
-            env->cp15.c14_pmevcntr[i] = new_pmswinc;
-        }
-    }
-}
-
 static bool hvf_sysreg_write_cp(CPUState *cpu, uint32_t reg, uint64_t val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -1721,7 +2156,8 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, uint32_t reg, uint64_t val)
     return false;
 }
 
-static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
+static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t syndrome,
+                            uint64_t val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
@@ -1734,66 +2170,8 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
                            SYSREG_OP2(reg),
                            val);
 
-    if (arm_feature(env, ARM_FEATURE_PMU)) {
-        switch (reg) {
-        case SYSREG_PMCCNTR_EL0:
-            pmu_op_start(env);
-            env->cp15.c15_ccnt = val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMCR_EL0:
-            pmu_op_start(env);
-
-            if (val & PMCRC) {
-                /* The counter has been reset */
-                env->cp15.c15_ccnt = 0;
-            }
-
-            if (val & PMCRP) {
-                unsigned int i;
-                for (i = 0; i < pmu_num_counters(env); i++) {
-                    env->cp15.c14_pmevcntr[i] = 0;
-                }
-            }
-
-            env->cp15.c9_pmcr &= ~PMCR_WRITABLE_MASK;
-            env->cp15.c9_pmcr |= (val & PMCR_WRITABLE_MASK);
-
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMUSERENR_EL0:
-            env->cp15.c9_pmuserenr = val & 0xf;
-            return 0;
-        case SYSREG_PMCNTENSET_EL0:
-            env->cp15.c9_pmcnten |= (val & pmu_counter_mask(env));
-            return 0;
-        case SYSREG_PMCNTENCLR_EL0:
-            env->cp15.c9_pmcnten &= ~(val & pmu_counter_mask(env));
-            return 0;
-        case SYSREG_PMINTENCLR_EL1:
-            pmu_op_start(env);
-            env->cp15.c9_pminten |= val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMOVSCLR_EL0:
-            pmu_op_start(env);
-            env->cp15.c9_pmovsr &= ~val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMSWINC_EL0:
-            pmu_op_start(env);
-            pmswinc_write(env, val);
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMSELR_EL0:
-            env->cp15.c9_pmselr = val & 0x1f;
-            return 0;
-        case SYSREG_PMCCFILTR_EL0:
-            pmu_op_start(env);
-            env->cp15.pmccfiltr_el0 = val & PMCCFILTR_EL0;
-            pmu_op_finish(env);
-            return 0;
-        }
+    if (arm_feature(env, ARM_FEATURE_PMU) && sysreg_is_pmu(reg)) {
+        return hvf_sysreg_access_pmu(cpu, reg, &val, false, syndrome);
     }
 
     switch (reg) {
@@ -1968,12 +2346,27 @@ static uint64_t hvf_vtimer_val(void)
 static void hvf_wait_for_ipi(CPUState *cpu, struct timespec *ts)
 {
     /*
+     * Cap open-ended waits so that a lost kick degrades to a short delay
+     * instead of an unbounded sleep (defense in depth on top of the
+     * unconditional signal in hvf_kick_vcpu_thread()).
+     */
+    struct timespec bounded = { .tv_sec = 0, .tv_nsec = 10 * SCALE_MS };
+
+    /*
      * Use pselect to sleep so that other threads can IPI us while we're
      * sleeping.
      */
     qatomic_set_mb(&cpu->thread_kicked, false);
+    /*
+     * A kick sent before thread_kicked was cleared may have been deduped;
+     * re-check the conditions it would have signalled before sleeping.
+     */
+    if (qatomic_read(&cpu->stop) ||
+        (cpu->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ))) {
+        return;
+    }
     bql_unlock();
-    pselect(0, 0, 0, 0, ts, &cpu->accel->unblock_ipi_mask);
+    pselect(0, 0, 0, 0, ts ? ts : &bounded, &cpu->accel->unblock_ipi_mask);
     bql_lock();
 }
 
@@ -2055,6 +2448,107 @@ static void hvf_sync_vtimer(CPUState *cpu)
     }
 }
 
+/*
+ * Refresh env->pstate from the vCPU.  The sysreg trap handlers run without
+ * a full cpu_synchronize_state(), but the cpreg access checks and the PMU
+ * model depend on arm_current_el(env), which would otherwise be stuck at
+ * whatever the last full sync (or reset) left behind.
+ */
+static void hvf_sync_pstate(CPUState *cpu)
+{
+    uint64_t cpsr;
+    hv_return_t r;
+
+    if (cpu->accel->dirty) {
+        /* env is authoritative and about to be pushed; don't clobber it */
+        return;
+    }
+
+    r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+    assert_hvf_ok(r);
+    pstate_write(&ARM_CPU(cpu)->env, cpsr);
+}
+
+/*
+ * PMCCNTR_EL0 read fast path.
+ *
+ * HVF cannot virtualize the PMU, so every guest read of the cycle counter
+ * is a full VM exit.  Windows on Arm reads it constantly -- its x64
+ * emulator implements RDTSC on it -- at hundreds of thousands of reads per
+ * second under an emulated game.  The general exit path takes the BQL,
+ * syncs the vtimer and returns to the vCPU thread loop for every one of
+ * them.  Serve the common case without any of that: the counter is
+ * enabled, unfiltered and 64-bit (no overflow interrupt to raise), so its
+ * value is a pure function of the virtual clock and this vCPU's own cp15
+ * state.  The only other writer of that state is arm_pmu_timer_cb() on the
+ * main-loop thread; pmu_op_start/finish flag its update spans via
+ * pmu_op_lock, which is checked before committing.  Returns false to take
+ * the general path.
+ */
+static bool hvf_pmccntr_read_fast(CPUState *cpu, uint64_t syndrome)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    hv_return_t r;
+    unsigned seq;
+
+    if (!(syndrome & 1) || (syndrome & SYSREG_MASK) != SYSREG_PMCCNTR_EL0) {
+        return false;
+    }
+    if (cpu->singlestep_enabled || cpu->accel->dirty ||
+        cpu->accel->vtimer_masked) {
+        return false;
+    }
+
+    seq = seqlock_read_begin(&arm_cpu->pmu_op_lock);
+
+    if (!arm_feature(env, ARM_FEATURE_PMU) ||
+        (env->cp15.c9_pmcr & (PMCRE | PMCRLC)) != (PMCRE | PMCRLC) ||
+        !(env->cp15.c9_pmcnten & (1u << 31)) ||
+        (env->cp15.pmccfiltr_el0 & (PMXEVTYPER_P | PMXEVTYPER_U))) {
+        return false;
+    }
+
+    /*
+     * EL0 reads need PMUSERENR_EL0.{EN,CR}; when neither is set, bail if
+     * we are at EL0 so the general path can raise the access trap.
+     */
+    if (!(env->cp15.c9_pmuserenr & 0x5)) {
+        uint64_t cpsr;
+
+        r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+        assert_hvf_ok(r);
+        if (((cpsr >> 2) & 3) == 0) {
+            return false;
+        }
+    }
+
+    /*
+     * Same value pmccntr_op_start would compute for the enabled counter
+     * (helper.c's cycles_get_count: 1 GHz on the virtual clock).
+     */
+    const uint64_t cycles = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     1000000000, NANOSECONDS_PER_SECOND);
+    const uint64_t val = cycles - env->cp15.c15_ccnt_delta;
+    const uint32_t rt = (syndrome >> 5) & 0x1f;
+    uint64_t pc;
+
+    if (seqlock_read_retry(&arm_cpu->pmu_op_lock, seq)) {
+        /* Raced an update; the general path will read a settled value */
+        return false;
+    }
+
+    if (rt < 31) {
+        r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_X0 + rt, val);
+        assert_hvf_ok(r);
+    }
+    r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_PC, &pc);
+    assert_hvf_ok(r);
+    r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_PC, pc + 4);
+    assert_hvf_ok(r);
+    return true;
+}
+
 int hvf_vcpu_exec(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -2074,14 +2568,33 @@ int hvf_vcpu_exec(CPUState *cpu)
     }
 
     flush_cpu_state(cpu);
+    hvf_arm_gic_flush_ppis(cpu);
 
+    uint64_t exit_reason, syndrome;
+    uint32_t ec;
     bql_unlock();
+run_again:
     assert_hvf_ok(hv_vcpu_run(cpu->accel->fd));
 
     /* handle VMEXIT */
-    uint64_t exit_reason = hvf_exit->reason;
-    uint64_t syndrome = hvf_exit->exception.syndrome;
-    uint32_t ec = syn_get_ec(syndrome);
+    exit_reason = hvf_exit->reason;
+    syndrome = hvf_exit->exception.syndrome;
+    ec = syn_get_ec(syndrome);
+
+    if (exit_reason == HV_EXIT_REASON_EXCEPTION &&
+        ec == EC_SYSTEMREGISTERTRAP && hvf_pmccntr_read_fast(cpu, syndrome)) {
+        /*
+         * Served without the BQL.  Go straight back into the guest unless
+         * something is pending for the general path; a kick that raced us
+         * is sticky in HVF and surfaces as a CANCELED exit on the next run.
+         */
+        if (!qatomic_read(&cpu->interrupt_request) &&
+            !qatomic_read(&cpu->exit_request) && !cpu->halted) {
+            goto run_again;
+        }
+        bql_lock();
+        return 0;
+    }
 
     ret = 0;
     bql_lock();
@@ -2090,6 +2603,10 @@ int hvf_vcpu_exec(CPUState *cpu)
         /* This is the main one, handle below. */
         break;
     case HV_EXIT_REASON_VTIMER_ACTIVATED:
+        if (hvf_irqchip_in_kernel()) {
+            /* the in-kernel GIC owns the timer PPI; this exit is not expected */
+            warn_report_once("HVF: VTIMER_ACTIVATED exit with the in-kernel GIC");
+        }
         qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
         cpu->accel->vtimer_masked = true;
         return 0;
@@ -2194,8 +2711,10 @@ int hvf_vcpu_exec(CPUState *cpu)
         uint64_t val;
         int sysreg_ret = 0;
 
+        hvf_sync_pstate(cpu);
+
         if (isread) {
-            sysreg_ret = hvf_sysreg_read(cpu, reg, &val);
+            sysreg_ret = hvf_sysreg_read(cpu, reg, syndrome, &val);
             if (!sysreg_ret) {
                 trace_hvf_sysreg_read(reg,
                                       SYSREG_OP0(reg),
@@ -2208,7 +2727,7 @@ int hvf_vcpu_exec(CPUState *cpu)
             }
         } else {
             val = hvf_get_reg(cpu, rt);
-            sysreg_ret = hvf_sysreg_write(cpu, reg, val);
+            sysreg_ret = hvf_sysreg_write(cpu, reg, syndrome, val);
         }
 
         advance_pc = !sysreg_ret;

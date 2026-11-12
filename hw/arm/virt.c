@@ -197,6 +197,8 @@ static const MemMapEntry base_memmap[] = {
 /* Update the docs for highmem-mmio-size when changing this default */
 #define DEFAULT_HIGH_PCIE_MMIO_SIZE_GB 512
 #define DEFAULT_HIGH_PCIE_MMIO_SIZE (DEFAULT_HIGH_PCIE_MMIO_SIZE_GB * GiB)
+/* Smallest window we will auto-shrink to, or accept from the user */
+#define VIRT_HIGH_PCIE_MMIO_MIN_SIZE (1 * GiB)
 
 /*
  * Highmem IO Regions: This memory map is floating, located after the RAM.
@@ -927,7 +929,8 @@ static void create_gic(VirtMachineState *vms, MemoryRegion *mem)
 
     if (vms->gic_version != VIRT_GIC_VERSION_2 && vms->its) {
         create_its(vms);
-    } else if (vms->gic_version == VIRT_GIC_VERSION_2) {
+    } else if (vms->gic_version == VIRT_GIC_VERSION_2 ||
+               hvf_irqchip_in_kernel()) {
         create_v2m(vms);
     }
 }
@@ -1812,6 +1815,40 @@ static inline bool *virt_get_high_memmap_enabled(VirtMachineState *vms,
     return enabled_array[index - VIRT_LOWMEMMAP_LAST];
 }
 
+static inline const char *virt_high_memmap_name(int index)
+{
+    static const char * const names[] = {
+        "GIC redistributor",
+        "PCIe ECAM",
+        "PCIe MMIO",
+    };
+
+    assert(ARRAY_SIZE(extended_memmap) - VIRT_LOWMEMMAP_LAST ==
+           ARRAY_SIZE(names));
+    assert(index - VIRT_LOWMEMMAP_LAST < ARRAY_SIZE(names));
+
+    return names[index - VIRT_LOWMEMMAP_LAST];
+}
+
+/*
+ * Return the first address above the high memmap if it were laid out
+ * starting at @base, assuming every region fits at full size. Mirrors the
+ * placement rules of virt_set_high_memmap().
+ */
+static hwaddr virt_high_memmap_end(VirtMachineState *vms, hwaddr base)
+{
+    int i;
+
+    for (i = VIRT_LOWMEMMAP_LAST; i < ARRAY_SIZE(extended_memmap); i++) {
+        if (vms->highmem_compact && !*virt_get_high_memmap_enabled(vms, i)) {
+            continue;
+        }
+        base = ROUND_UP(base, extended_memmap[i].size) + extended_memmap[i].size;
+    }
+
+    return base;
+}
+
 static void virt_set_high_memmap(VirtMachineState *vms,
                                  hwaddr base, int pa_bits)
 {
@@ -1823,6 +1860,33 @@ static void virt_set_high_memmap(VirtMachineState *vms,
         region_enabled = virt_get_high_memmap_enabled(vms, i);
         region_base = ROUND_UP(base, extended_memmap[i].size);
         region_size = extended_memmap[i].size;
+
+        /*
+         * The high PCIe MMIO window is the only configurable high region
+         * and by far the largest. If it doesn't fit (e.g. in a 36-bit PA
+         * space), shrink it to the largest power of two that does rather
+         * than dropping it: without it, no 64-bit BAR too large for the
+         * 32-bit window can ever be placed.
+         */
+        if (i == VIRT_HIGH_PCIE_MMIO && *region_enabled && vms->highmem) {
+            while (region_size > VIRT_HIGH_PCIE_MMIO_MIN_SIZE &&
+                   region_base + region_size > BIT_ULL(pa_bits)) {
+                region_size /= 2;
+                region_base = ROUND_UP(base, region_size);
+            }
+            if (region_base + region_size > BIT_ULL(pa_bits)) {
+                /* Not even the minimum fits; restore and disable below */
+                region_size = extended_memmap[i].size;
+                region_base = ROUND_UP(base, region_size);
+            } else if (region_size != extended_memmap[i].size) {
+                g_autofree char *from = size_to_str(extended_memmap[i].size);
+                g_autofree char *to = size_to_str(region_size);
+
+                warn_report("high PCIe MMIO window shrunk from %s to %s to fit "
+                            "in a %d-bit physical address space", from, to,
+                            pa_bits);
+            }
+        }
 
         vms->memmap[i].base = region_base;
         vms->memmap[i].size = region_size;
@@ -1836,6 +1900,12 @@ static void virt_set_high_memmap(VirtMachineState *vms,
          * For each device that doesn't fit, disable it.
          */
         fits = (region_base + region_size) <= BIT_ULL(pa_bits);
+        /* !highmem disables these on purpose, so keep quiet about it */
+        if (*region_enabled && !fits && vms->highmem) {
+            warn_report("high %s region does not fit in a %d-bit physical "
+                        "address space and has been disabled",
+                        virt_high_memmap_name(i), pa_bits);
+        }
         *region_enabled &= fits;
         if (vms->highmem_compact && !*region_enabled) {
             continue;
@@ -1851,7 +1921,7 @@ static void virt_set_high_memmap(VirtMachineState *vms,
 static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
 {
     MachineState *ms = MACHINE(vms);
-    hwaddr base, device_memory_base, device_memory_size, memtop;
+    hwaddr base, device_memory_base, device_memory_size, memtop, legacy_base;
     int i;
 
     vms->memmap = extended_memmap;
@@ -1900,8 +1970,18 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
         error_report("maxmem/slots too huge");
         exit(EXIT_FAILURE);
     }
-    if (base < vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES) {
-        base = vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES;
+    /*
+     * Pin the high IO region at 256GiB so a VM with less than 255GiB of
+     * RAM keeps the legacy memory map. Skip that floor when the high
+     * regions cannot fit there in the PA space, as they would all be
+     * disabled and the guest left with no 64-bit MMIO window. !highmem
+     * keeps the floor: disabling them is the point of that option.
+     */
+    legacy_base = vms->memmap[VIRT_MEM].base + LEGACY_RAMLIMIT_BYTES;
+    if (base < legacy_base &&
+        (!vms->highmem ||
+         virt_high_memmap_end(vms, legacy_base) <= BIT_ULL(pa_bits))) {
+        base = legacy_base;
     }
 
     /* We know for sure that at least the memory fits in the PA space */
@@ -2023,6 +2103,10 @@ static void finalize_gic_version(VirtMachineState *vms)
         /* KVM w/o kernel irqchip can only deal with GICv2 */
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         accel_name = "KVM with kernel-irqchip=off";
+    } else if (hvf_enabled() && hvf_irqchip_in_kernel()) {
+        /* the Hypervisor.framework GIC is a GICv3 without EL2 support */
+        gics_supported |= VIRT_GIC_VERSION_3_MASK;
+        accel_name = "HVF with kernel-irqchip=on";
     } else if (tcg_enabled() || hvf_enabled() || qtest_enabled())  {
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         if (module_object_class_by_name("arm-gicv3")) {
@@ -2160,6 +2244,21 @@ static void machvirt_init(MachineState *machine)
      * KVM is not available yet
      */
     finalize_gic_version(vms);
+
+    if (hvf_irqchip_in_kernel()) {
+        /*
+         * hv_gic_create() must precede vCPU creation, which happens when
+         * the CPUs are realized below; the "hvf-arm-gicv3" device created
+         * by create_gic() only wires lines to it.  The hypervisor GIC has
+         * no ITS, so PCI MSIs come from a GICv2m frame instead.
+         */
+        hvf_arm_gic_create(vms->memmap[VIRT_GIC_DIST].base,
+                           vms->memmap[VIRT_GIC_REDIST].base,
+                           vms->memmap[VIRT_GIC_REDIST].size,
+                           machine->smp.max_cpus, NUM_IRQS, &error_fatal);
+        vms->its = false;
+        vms->tcg_its = false;
+    }
 
     if (vms->secure) {
         /*
@@ -2594,10 +2693,14 @@ static void virt_set_highmem_mmio_size(Object *obj, Visitor *v,
         return;
     }
 
-    if (size < DEFAULT_HIGH_PCIE_MMIO_SIZE) {
-        char *sz = size_to_str(DEFAULT_HIGH_PCIE_MMIO_SIZE);
+    /*
+     * Windows smaller than the default are allowed: a host with a small
+     * PA space cannot fit the default anywhere.
+     */
+    if (size < VIRT_HIGH_PCIE_MMIO_MIN_SIZE) {
+        char *sz = size_to_str(VIRT_HIGH_PCIE_MMIO_MIN_SIZE);
         error_setg(errp, "highmem-mmio-size cannot be set to a lower value "
-                         "than the default (%s)", sz);
+                         "than %s", sz);
         g_free(sz);
         return;
     }

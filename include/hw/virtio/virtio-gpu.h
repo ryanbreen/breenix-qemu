@@ -142,8 +142,26 @@ struct virtio_gpu_ctrl_command {
     bool finished;
     /* Set if process_cmd deferred completion; keep at cmdq head for resume. */
     bool suspended;
+    /*
+     * Set if process_cmd took ownership of the command to complete it later
+     * (a mapped blob's teardown waits for the memory region to finalize):
+     * it leaves cmdq without a response and without blocking the queue.
+     */
+    bool deferred;
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
+
+/* virtqueue_pop() does not zero the element, so every popper must reset
+ * the per-command state that virtio_gpu_process_cmdq() reads. */
+static inline void virtio_gpu_ctrl_cmd_init(struct virtio_gpu_ctrl_command *cmd,
+                                            VirtQueue *vq)
+{
+    cmd->vq = vq;
+    cmd->error = 0;
+    cmd->finished = false;
+    cmd->suspended = false;
+    cmd->deferred = false;
+}
 
 struct VirtIOGPUBase {
     VirtIODevice parent_obj;
@@ -245,6 +263,13 @@ struct VirtIOGPUClass {
                              Error **errp);
 };
 
+struct virtio_gpu_virgl_context_fence {
+    uint32_t ctx_id;
+    uint32_t ring_idx;
+    uint64_t fence_id;
+    QSLIST_ENTRY(virtio_gpu_virgl_context_fence) next;
+};
+
 /* VirtIOGPUGL renderer states */
 typedef enum {
     RS_START,       /* starting state */
@@ -252,6 +277,8 @@ typedef enum {
     RS_INITED,      /* initialised and working */
     RS_RESET,       /* inited and reset pending, moves to start after reset */
 } RenderState;
+
+struct virtio_gpu_virgl_hostmem_region;
 
 struct VirtIOGPUGL {
     struct VirtIOGPU parent_obj;
@@ -262,6 +289,14 @@ struct VirtIOGPUGL {
     QEMUTimer *print_stats;
 
     QEMUBH *cmdq_resume_bh;
+    /* Hostmem regions whose MemoryRegion finalized; cmdq_resume_bh finishes
+     * their unmap (and any deferred unref) on the main loop. */
+    QTAILQ_HEAD(, virtio_gpu_virgl_hostmem_region) unmap_done_list;
+
+    QEMUBH *async_fence_bh;
+    QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
+    /* fences retire via async_fence_bh; fence_poll is only a watchdog */
+    bool async_fence_enabled;
 };
 
 struct VhostUserGPU {
@@ -405,5 +440,6 @@ void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
                                        Error **errp);
 int virtio_gpu_virgl_init(VirtIOGPU *g);
 GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);
+void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g);
 
 #endif
