@@ -23,6 +23,8 @@
 #include "system/system.h"
 #include "qapi/error.h"
 #include "trace.h"
+#include "breenix-qemu-gl-pin.h"
+#include "breenix-blob-cache.h"
 
 EGLDisplay *qemu_egl_display;
 EGLConfig qemu_egl_config;
@@ -521,6 +523,7 @@ static int qemu_egl_init_dpy(EGLDisplay dpy, DisplayGLMode mode)
         return -1;
     }
 
+    breenix_blob_cache_install(qemu_egl_display, BREENIX_QEMU_GL_PIN);
     qemu_egl_mode = gles ? DISPLAY_GL_MODE_ES : DISPLAY_GL_MODE_CORE;
     return 0;
 }
