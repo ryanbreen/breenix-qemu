@@ -1186,10 +1186,21 @@ static void virtio_gpu_handle_cursor(VirtIODevice *vdev, VirtQueue *vq)
     }
 }
 
-static void virtio_gpu_cursor_bh(void *opaque)
+static void virtio_gpu_cursor_work(void *opaque)
 {
     VirtIOGPU *g = opaque;
     virtio_gpu_handle_cursor(&g->parent_obj.parent_obj, g->cursor_vq);
+}
+
+static void virtio_gpu_cursor_bh(void *opaque)
+{
+    VirtIOGPU *g = opaque;
+    VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
+    if (vgc->schedule) {
+        vgc->schedule(g, virtio_gpu_cursor_work, g);
+    } else {
+        virtio_gpu_cursor_work(g);
+    }
 }
 
 static bool scanout_vmstate_after_v2(void *opaque, int version)

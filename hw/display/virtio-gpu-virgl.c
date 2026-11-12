@@ -24,6 +24,8 @@
 
 #define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
+#include "breenix-virgl-rpc.h"
+extern EGLContext breenix_renderer_share;
 
 #define NATIVE_HANDLE_SUPPORT_VERSION (1)
 
@@ -174,7 +176,7 @@ virtio_gpu_virgl_finish_unmap(VirtIOGPU *g,
     g_free(cmd);
 }
 
-static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
+static void virtio_gpu_virgl_resume_cmdq_bh_work(void *opaque)
 {
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
@@ -185,6 +187,11 @@ static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
     }
 
     virtio_gpu_process_cmdq(g);
+}
+
+static void virtio_gpu_virgl_resume_cmdq_bh(void *opaque)
+{
+    virtio_gpu_gl_schedule(opaque, virtio_gpu_virgl_resume_cmdq_bh_work, opaque);
 }
 
 /*
@@ -594,8 +601,12 @@ static void breenix_attest_json_str(GString *out, const char *s)
     g_string_append_c(out, '"');
 }
 
-static void breenix_attest(const char *event, uint32_t ctx_id)
+typedef struct BreenixAttest { const char *event; uint32_t ctx_id; } BreenixAttest;
+static void breenix_attest_job(void *opaque)
 {
+    BreenixAttest *arg = opaque;
+    const char *event = arg->event;
+    uint32_t ctx_id = arg->ctx_id;
     const char *path = getenv("BREENIX_HOST_RENDERER_JSON");
     const char *vendor = NULL, *renderer = NULL, *version = NULL;
     const char *egl_vendor = NULL, *egl_version = NULL;
@@ -643,6 +654,12 @@ static void breenix_attest(const char *event, uint32_t ctx_id)
         error_report("virtio-gpu: cannot write %s", path);
     }
 }
+static void breenix_attest(const char *event, uint32_t ctx_id)
+{
+    BreenixAttest arg = { event, ctx_id };
+    virtio_gpu_renderer_call(breenix_attest_job, &arg);
+}
+
 
 static void virgl_cmd_context_create(VirtIOGPU *g,
                                      struct virtio_gpu_ctrl_command *cmd)
@@ -697,6 +714,7 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
         return;
     }
 
+    virtio_gpu_renderer_flush();
     dpy_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
 }
 
@@ -784,9 +802,10 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
             return;
         }
+        virgl_renderer_force_ctx_0();
+        virtio_gpu_renderer_flush();
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
-        virgl_renderer_force_ctx_0();
         dpy_gl_scanout_texture(
             g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
@@ -1241,6 +1260,7 @@ static bool virgl_scanout_native_blob(VirtIOGPU *g,
             .type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL,
             .handle = handle,
         };
+        virtio_gpu_renderer_flush();
         qemu_console_resize(scanout->con,
                             ss->r.width, ss->r.height);
         dpy_gl_scanout_texture(
@@ -1545,7 +1565,7 @@ void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g)
 }
 
 #if VIRGL_CHECK_VERSION(1, 1, 2)
-static void virtio_gpu_virgl_async_fence_bh(void *opaque)
+static void virtio_gpu_virgl_async_fence_bh_work(void *opaque)
 {
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
     struct virtio_gpu_virgl_context_fence *f;
@@ -1581,6 +1601,11 @@ static void virtio_gpu_virgl_async_fence_bh(void *opaque)
 
         g_free(f);
     }
+}
+
+static void virtio_gpu_virgl_async_fence_bh(void *opaque)
+{
+    virtio_gpu_gl_schedule(opaque, virtio_gpu_virgl_async_fence_bh_work, opaque);
 }
 
 static void
@@ -1624,6 +1649,14 @@ virgl_create_context(void *opaque, int scanout_idx,
     QEMUGLContext ctx;
     QEMUGLParams qparams;
 
+    if (breenix_renderer_share) {
+        EGLint attrs[] = { EGL_CONTEXT_MAJOR_VERSION, params->major_ver,
+                           EGL_CONTEXT_MINOR_VERSION, params->minor_ver, EGL_NONE };
+        eglBindAPI(qemu_egl_mode == DISPLAY_GL_MODE_ES ? EGL_OPENGL_ES_API :
+                                                        EGL_OPENGL_API);
+        return eglCreateContext(qemu_egl_display, qemu_egl_config,
+                                breenix_renderer_share, attrs);
+    }
     qparams.major_ver = params->major_ver;
     qparams.minor_ver = params->minor_ver;
 
@@ -1636,6 +1669,10 @@ static void virgl_destroy_context(void *opaque, virgl_renderer_gl_context ctx)
     VirtIOGPU *g = opaque;
     QEMUGLContext qctx = (QEMUGLContext)ctx;
 
+    if (breenix_renderer_share) {
+        eglDestroyContext(qemu_egl_display, ctx);
+        return;
+    }
     dpy_gl_ctx_destroy(g->parent_obj.scanout[0].con, qctx);
 }
 
@@ -1645,6 +1682,10 @@ static int virgl_make_context_current(void *opaque, int scanout_idx,
     VirtIOGPU *g = opaque;
     QEMUGLContext qctx = (QEMUGLContext)ctx;
 
+    if (breenix_renderer_share) {
+        return eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                               ctx) ? 0 : -1;
+    }
     return dpy_gl_ctx_make_current(g->parent_obj.scanout[scanout_idx].con,
                                    qctx);
 }
@@ -1685,7 +1726,7 @@ static void virtio_gpu_print_stats(void *opaque)
     timer_mod(gl->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
-static void virtio_gpu_fence_poll(void *opaque)
+static void virtio_gpu_fence_poll_work(void *opaque)
 {
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
@@ -1727,6 +1768,11 @@ static void virtio_gpu_fence_poll(void *opaque)
         timer_mod(gl->fence_poll,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + period_ms);
     }
+}
+
+static void virtio_gpu_fence_poll(void *opaque)
+{
+    virtio_gpu_gl_schedule(opaque, virtio_gpu_fence_poll_work, opaque);
 }
 
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g)
