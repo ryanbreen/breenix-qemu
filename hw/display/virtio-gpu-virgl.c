@@ -584,6 +584,8 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
  * commands, read in this process.  The JSON trailer is replaced after each record; prior evidence stays on disk.
  */
 #define BREENIX_ATTEST_MAX_BYTES (64 * 1024 * 1024)
+/* Bound live submission tracking independently of the on-disk event history. */
+#define BREENIX_ATTEST_MAX_RECORDS 128
 static FILE *breenix_attest_file;
 static size_t breenix_attest_bytes;
 static bool breenix_attest_has_records;
