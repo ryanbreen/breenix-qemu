@@ -581,10 +581,13 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
  * file, record the GL_VENDOR, GL_RENDERER and GL_VERSION of the GL context that
  * virglrenderer left current after creating each guest renderer context and
  * after that context's first SUBMIT_3D: the context that executes the guest's
- * commands, read in this process.  The file is rewritten whole after each record.
+ * commands, read in this process.  The JSON trailer is replaced after each record; prior evidence stays on disk.
  */
-#define BREENIX_ATTEST_MAX_RECORDS 128
-static GQueue breenix_attest_records = G_QUEUE_INIT;
+#define BREENIX_ATTEST_MAX_BYTES (64 * 1024 * 1024)
+static FILE *breenix_attest_file;
+static size_t breenix_attest_bytes;
+static bool breenix_attest_has_records;
+static bool breenix_attest_refused;
 static GHashTable *breenix_attest_submitted;
 
 static void breenix_attest_json_str(GString *out, const char *s)
@@ -608,6 +611,57 @@ static void breenix_attest_json_str(GString *out, const char *s)
     g_string_append_c(out, '"');
 }
 
+/* Bounded memory, complete boot history. Overflow is a permanent refusal event
+ * that the checker rejects, rather than a tail that conceals earlier evidence.
+ * Readers inspect the file after the VM stops, not while the trailer is replaced.
+ */
+static void breenix_attest_write(const char *path, GString *record)
+{
+    static const char tail[] = "\n  ]\n}\n";
+    if (breenix_attest_refused) {
+        return;
+    }
+    if (!breenix_attest_file) {
+        breenix_attest_file = fopen(path, "w+b");
+        if (!breenix_attest_file) {
+            goto error;
+        }
+        int n = fprintf(breenix_attest_file,
+                        "{\n  \"format\": 1,\n  \"pid\": %d,\n  \"records\": [",
+                        (int)getpid());
+        if (n < 0 || fputs(tail, breenix_attest_file) == EOF) {
+            goto error;
+        }
+        breenix_attest_bytes = n;
+    }
+    if (fseek(breenix_attest_file, -(long)(sizeof(tail) - 1), SEEK_END)) {
+        goto error;
+    }
+    const char *text = record->str;
+    if (breenix_attest_bytes + record->len + 2 > BREENIX_ATTEST_MAX_BYTES) {
+        text = "    {\"event\": \"attestation-overflow\", \"ctx_id\": 0}";
+        breenix_attest_refused = true;
+    }
+    if ((breenix_attest_has_records && fputs(",\n", breenix_attest_file) == EOF) ||
+        fputs(text, breenix_attest_file) == EOF ||
+        fputs(tail, breenix_attest_file) == EOF ||
+        fflush(breenix_attest_file) == EOF) {
+        goto error;
+    }
+    breenix_attest_has_records = true;
+    breenix_attest_bytes += strlen(text) + 2;
+    return;
+error:
+    breenix_attest_refused = true;
+    error_report("virtio-gpu: cannot write %s", path);
+    if (breenix_attest_file) {
+        fclose(breenix_attest_file);
+        breenix_attest_file = NULL;
+    }
+    /* A write failure must not leave a previously valid prefix accepted. */
+    unlink(path);
+}
+
 typedef struct BreenixAttest { const char *event; uint32_t ctx_id; } BreenixAttest;
 static void breenix_attest_job(void *opaque)
 {
@@ -617,9 +671,7 @@ static void breenix_attest_job(void *opaque)
     const char *path = getenv("BREENIX_HOST_RENDERER_JSON");
     const char *vendor = NULL, *renderer = NULL, *version = NULL;
     const char *egl_vendor = NULL, *egl_version = NULL;
-    g_autofree char *tmp = NULL;
-    g_autoptr(GString) doc = NULL;
-    GString *rec;
+    g_autoptr(GString) rec = NULL;
 
     if (!path || !*path) {
         return;
@@ -645,28 +697,18 @@ static void breenix_attest_job(void *opaque)
     breenix_attest_json_str(rec, egl_version);
     g_string_append(rec, "}");
 
-    g_queue_push_tail(&breenix_attest_records, g_string_free(rec, false));
-    if (breenix_attest_records.length > BREENIX_ATTEST_MAX_RECORDS) {
-        g_free(g_queue_pop_head(&breenix_attest_records));
-    }
-    doc = g_string_new(NULL);
-    g_string_append_printf(doc, "{\n  \"format\": 1,\n  \"pid\": %d,\n"
-                           "  \"records\": [\n", (int)getpid());
-    for (GList *item = breenix_attest_records.head; item; item = item->next) {
-        g_string_append(doc, item->data);
-        g_string_append(doc, item->next ? ",\n" : "\n");
-    }
-    g_string_append(doc, "  ]\n}\n");
-    tmp = g_strdup_printf("%s.tmp", path);
-    if (!g_file_set_contents(tmp, doc->str, doc->len, NULL) ||
-        rename(tmp, path) != 0) {
-        error_report("virtio-gpu: cannot write %s", path);
-    }
+    breenix_attest_write(path, rec);
 }
 static void breenix_attest_reset(void *opaque G_GNUC_UNUSED)
 {
     const char *path = getenv("BREENIX_HOST_RENDERER_JSON");
-    g_queue_clear_full(&breenix_attest_records, g_free);
+    if (breenix_attest_file) {
+        fclose(breenix_attest_file);
+        breenix_attest_file = NULL;
+    }
+    breenix_attest_bytes = 0;
+    breenix_attest_has_records = false;
+    breenix_attest_refused = false;
     if (path && *path) {
         unlink(path);
     }
